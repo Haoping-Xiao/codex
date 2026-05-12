@@ -179,3 +179,106 @@ A：**`LiveThread`** 写卷宗；**`ActiveTurn`** 挂当前回合 **`RunningTask
 ## 21. 再一句总背（工具链 + 子会话）
 
 **`ToolRouter` 编译本轮可见工具；`ToolCallRuntime` 执行工具调用外壳；`Review` 用 `SessionTask` 占工位再起子 `Codex`；`Guardian` 旁路子 `Codex` 不占 `ReviewTask` 那套工位叙事。**
+
+---
+
+## 22. `ToolOrchestrator` 谁用？
+
+**Q：内置工具哪些走 `ToolOrchestrator`？**  
+A：全仓显式 `ToolOrchestrator::new` 基本三类：**shell 族 `run_exec_like`**（`shell` / `local_shell` / `shell_command` / `container.exec`）、**`apply_patch` 委托运行时分支**、**`UnifiedExecProcessManager::exec_command` 内部**。`write_stdin` 只碰已起进程，**不走**编排器。其余内置 handler **未引用** `ToolOrchestrator`。
+
+**Q：`exec_command` 和 `shell`？**  
+A：**两个不同工具名**：`exec_command` 一条 `cmd` 字符串 + PTY/`yield`/`write_stdin` 会话语义；`shell` 偏 argv + `timeout_ms` 一次性输出。都可并行工具，但管线不同（unified exec vs `run_exec_like`）。
+
+---
+
+## 23. 权限 profile / 文件系统 / 网络从哪来？
+
+**Q：内置 `:read-only` / `:workspace` 谁写的？**  
+A：**代码预制套餐**；你用 `default_permissions` **点名**用哪套。
+
+**Q：自定义 `[permissions.xxx]`？**  
+A：**你写 TOML** 的 `filesystem` / `network`，加载时 **compile** 成内部的 `FileSystemSandboxPolicy` + `NetworkSandboxPolicy`。内置套餐也可被 **`sandbox_workspace_write`** 等旋钮叠一层。
+
+**Q：啥都不配？**  
+A：仍有 **隐式默认**（信任未定时更偏保守 `:read-only` 等逻辑），不是零策略。
+
+---
+
+## 24. `:read-only` 人话
+
+**Q：只读还能改代码吗？**  
+A：**这套 profile 本来就不是为随便写仓库设计的**；日常改代码用 **`:workspace`** 或自定义可写 profile。
+
+**Q：只读整台电脑还是一个文件？**  
+A：**都不是字面那样**；是 **Codex 管理沙箱下**对「能读/能写哪」的策略，外加 **元数据路径保护**（`.git` / `.agents` / `.codex` 等）。不是 OS 级把你磁盘全局 chmod。
+
+---
+
+## 25. 用户提交 vs 工具并行锁
+
+**Q：用户侧怎么不乱序？**  
+A：**提交队列 + `submission_loop` 串行消费**，不是泛化「事件总线一条一条」。
+
+**Q：工具并行怎么防踩？**  
+A：**同回合一把 `Arc<RwLock<()>>`**：`supports_parallel==true` 拿 **读锁**（可叠加）；`false` 拿 **写锁**（独占、与读互斥）。**写锁会等**，不是「申请不到就失败」。**不是按文件 flock** 当主机制。
+
+---
+
+## 26. Rollout 恢复：`TurnContextItem` vs `PreviousTurnSettings`
+
+**Q：啥区别？**  
+A：**`TurnContextItem`** 是 **持久化整包回合基线**（cwd、审批/沙箱/权限/网络、模型、指令、截断等一大堆）。**`PreviousTurnSettings`** 是 **从上一回合抽的两字段小条**（`model` + `realtime_active`），给差分/再注入用；反向重建里从 `TurnContextItem` **抄这两样**填进去。
+
+---
+
+## 27. Goal：实现 +「会不会自己跑到完成」
+
+**Q：Goal 是啥？**  
+A：**每线程一条**、**SQLite `state_db`** 持久化；**`get_goal` / `create_goal` / `update_goal`** 给模型；**`Session` + `goals.rs`** 记账发 **`ThreadGoalUpdated`**；**`Feature::Goals`** 关则接口直接报错。
+
+**Q：模型 `update_goal` 能随便改状态吗？**  
+A：**不能**；handler 里 **只允许标 `complete`**；暂停/改目标等多走 **app-server `ThreadGoalSet` / `Clear` 等** 或 UI。
+
+**Q：会自动跑到 goal 完成吗？**  
+A：**没有强保证**。**空闲时** `MaybeContinueIfIdle` → 可能 **`push_pending_input` 塞一条 `developer` 消息**（`continuation.md` 渲染，含 `<untrusted_objective>` 与预算段）→ **`start_task(..., RegularTask)`** 再推一轮。**完成**仍要 **`update_goal(complete)`** 或外部 Set；另有 **rate limit guard**、**预算触顶 steering**、**plan 模式跳过 continuation** 等。
+
+---
+
+## 28. Multi-agent vs sub-agent；`list_agents`；`agent_type`
+
+**Q：multi-agent 就是 sub-agent 吗？**  
+A：**协作 spawn 那条是 `SessionSource::SubAgent(ThreadSpawn…)` + `ThreadSource::Subagent`，`AgentControl` 管树**。但 **sub-agent 不只有 multi-agent**（例：**Guardian**、**Review 子 `Codex`** 也带 subagent 语义，路径不同）。
+
+**Q：`list_agents` 干啥？**  
+A：**列当前根线程子树里还活着的 agent**（可选 `path_prefix` 按 `AgentPath` 过滤），给模型 **`send_message` / `wait` / `close`** 前 ** discovery**。
+
+**Q：`spawn_agent` 的 `agent_type` 谁定义？**  
+A：**字符串由模型填**，但必须匹配 **配置里解析出的 role 名**（内置 + 用户 role 文件）；未知会 **`unknown agent_type`**。不是主会话运行时「发明新类型对象」。
+
+---
+
+## 29. Memory：Phase1 / Phase2 产物 + 超长线程 + 护栏 + 扩展
+
+**Q：Phase1 产物？**  
+A：**SQLite `stage1_outputs` 一行 `Stage1Output` / 线程**（`raw_memory` md + `rollout_summary` + 元数据）；**upsert**，rollout 变新会 **刷新同线程那一行**，不是无限堆历史版本。
+
+**Q：Phase2 产物？**  
+A：磁盘 **`memories/` git 工作区**：同步 **`rollout_summaries/*.md`**、**`raw_memories.md`**、**`phase2_workspace_diff.md`**；内部 **consolidation `CodexThread`**（cwd=memory 根、关网、关 MCP/协作/再生成记忆）改 **`memory_summary.md`** 等成品；DB 记 **Phase2 job 成功 + watermark**。
+
+**Q：线程超级长？**  
+A：Phase1 输入 JSON **按 token 预算 `truncate_middle_with_token_budget`（头尾保留）**；仍再靠模型 **压缩成高信号笔记**，不是整卷拷贝进库。
+
+**Q：`guard.rs` 护栏是啥？**  
+A：**几乎只做 rate limit**：后端额度太紧就 **整条 memory 流水线跳过**。其它「护栏」分散在：**输出 schema strict、脱敏、Phase2 沙箱、禁止记忆递归、Phase1/2 系统提示卫生规则**。
+
+**Q：extensions 人话？**  
+A：**第二种资料入口**（例：内置 **`ad_hoc` 随手记**），每个子目录自带 **`instructions.md`** 告诉合并模型 **怎么读、多不可信、删资源时怎么清陈旧记忆**；不必把每种外来笔记硬编码进核心 Rust。
+
+---
+
+## 30. Prompt injection 防御
+
+**Q：Codex 防吗？**  
+A：**有， Defense-in-depth**：**沙箱/审批/工具门** 硬减伤；**Guardian「证据不可信」**、**goal/memory 模板 `<untrusted_objective>` / rollout 当 data not instructions** 等软提示；**项目 trust + 默认策略**；**Hooks** 可再加闸。  
+**不能**说成「提示词层面彻底免疫」；**LLM 仍可能被带偏**，工程目标是 **限制后果**。
